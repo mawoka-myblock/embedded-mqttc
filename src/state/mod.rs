@@ -3,6 +3,7 @@ use core::ops::Add;
 
 use embassy_futures::select::select3;
 use embassy_sync::pubsub::{DynSubscriber, PubSubChannel};
+use embassy_time::Timer;
 use embedded_nal_async::{Dns, TcpConnect};
 
 use crate::client::MqttClient;
@@ -18,7 +19,7 @@ use embassy_sync::blocking_mutex::raw::RawMutex;
 use mqttrs2::{LastWill, Packet, Publish, QoS, QosPid};
 use ping::PingState;
 
-use crate::{ClientConfig, MqttError, MqttEvent, UniqueID, time};
+use crate::{time, ClientConfig, MqttError, MqttEvent, UniqueID};
 
 pub(crate) const KEEP_ALIVE: usize = 60;
 
@@ -31,8 +32,8 @@ pub mod connection;
 /// outgoing publishes
 pub(crate) mod publish2;
 
-pub(crate) mod sub2;
 pub(crate) mod pid;
+pub(crate) mod sub2;
 
 pub(crate) mod request;
 
@@ -48,9 +49,11 @@ pub enum SendResult {
 }
 
 impl SendResult {
-
-    pub async fn next<F, Fut>(self, f: F) -> Result<Self, MqttError> 
-    where F: FnOnce() -> Fut, Fut: Future<Output = Result<Self, MqttError>> {
+    pub async fn next<F, Fut>(self, f: F) -> Result<Self, MqttError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Self, MqttError>>,
+    {
         if self != Self::PartiallySent {
             let next = self + f().await?;
             Ok(next)
@@ -59,8 +62,10 @@ impl SendResult {
         }
     }
 
-    pub fn next_sync<F>(self, f: F) -> Result<Self, MqttError> 
-    where F: FnOnce() -> Result<Self, MqttError> {
+    pub fn next_sync<F>(self, f: F) -> Result<Self, MqttError>
+    where
+        F: FnOnce() -> Result<Self, MqttError>,
+    {
         if self != Self::PartiallySent {
             let next = self + f()?;
             Ok(next)
@@ -68,7 +73,6 @@ impl SendResult {
             Ok(self)
         }
     }
-
 }
 
 impl Add<Self> for SendResult {
@@ -77,15 +81,25 @@ impl Add<Self> for SendResult {
     fn add(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Self::SentAll, Self::SentAll) => Self::SentAll,
-            _ => Self::PartiallySent
+            _ => Self::PartiallySent,
         }
     }
 }
 
-pub struct State<'n, 'l, M: RawMutex, NET, DNS, const BUFFER: usize, const TOPIC: usize, const QUEUE: usize> 
-where NET: TcpConnect, DNS: Dns {
-
-    pub(crate) connection_state: TcpConnectionState<'n, 'l, M, NET, DNS, BUFFER>, 
+pub struct State<
+    'n,
+    'l,
+    M: RawMutex,
+    NET,
+    DNS,
+    const BUFFER: usize,
+    const TOPIC: usize,
+    const QUEUE: usize,
+> where
+    NET: TcpConnect,
+    DNS: Dns,
+{
+    pub(crate) connection_state: TcpConnectionState<'n, 'l, M, NET, DNS, BUFFER>,
 
     ping: PingState<M>,
 
@@ -96,14 +110,29 @@ where NET: TcpConnect, DNS: Dns {
     // Signal is sent, when a request is added
     on_requst_added: RequestState<M>,
 
-    events: PubSubChannel<M, MqttEvent, 8, 16, 2>
-
+    events: PubSubChannel<M, MqttEvent, 8, 16, 2>,
 }
 
-impl <'n, 'l, M: RawMutex, NET, DNS, const BUFFER: usize, const TOPIC: usize, const QUEUE: usize> State<'n, 'l, M, NET, DNS, BUFFER, TOPIC, QUEUE> 
-where NET: TcpConnect, DNS: Dns{
-
-    pub fn new(config: ClientConfig<'l>, last_will: Option<LastWill<'l>>, network: &'n NET, dns: DNS) -> Self {
+impl<
+        'n,
+        'l,
+        M: RawMutex,
+        NET,
+        DNS,
+        const BUFFER: usize,
+        const TOPIC: usize,
+        const QUEUE: usize,
+    > State<'n, 'l, M, NET, DNS, BUFFER, TOPIC, QUEUE>
+where
+    NET: TcpConnect,
+    DNS: Dns,
+{
+    pub fn new(
+        config: ClientConfig<'l>,
+        last_will: Option<LastWill<'l>>,
+        network: &'n NET,
+        dns: DNS,
+    ) -> Self {
         Self {
             connection_state: TcpConnectionState::new(network, dns, last_will, config),
 
@@ -122,8 +151,14 @@ where NET: TcpConnect, DNS: Dns{
         MqttClient::new(self)
     }
 
-    pub(crate) async fn publish(&self, topic: &str, payload: &[u8], qos: QoS, retain: bool, unique_id: UniqueID) -> Result<(), MqttError> {
-
+    pub(crate) async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+        unique_id: UniqueID,
+    ) -> Result<(), MqttError> {
         let qospid = match qos {
             QoS::AtMostOnce => QosPid::AtMostOnce,
             QoS::AtLeastOnce => QosPid::AtLeastOnce(next_pid()),
@@ -137,7 +172,7 @@ where NET: TcpConnect, DNS: Dns{
             dup: false,
             qospid,
             retain,
-            payload
+            payload,
         };
 
         self.publishes.publish(publish, unique_id).await?;
@@ -147,12 +182,16 @@ where NET: TcpConnect, DNS: Dns{
     }
 
     pub(crate) async fn subscribe(&self, topics: &[&str], qos: QoS, unique_id: UniqueID) {
-        self.subscribes.add_subscribe_request(topics, qos, unique_id).await;
+        self.subscribes
+            .add_subscribe_request(topics, qos, unique_id)
+            .await;
         self.on_requst_added.notify_new_request();
     }
 
     pub(crate) async fn unsubscribe(&self, topics: &[&str], unique_id: UniqueID) {
-        self.subscribes.add_unsubscribe_request(topics, unique_id).await;
+        self.subscribes
+            .add_unsubscribe_request(topics, unique_id)
+            .await;
         self.on_requst_added.notify_new_request();
     }
 
@@ -171,13 +210,22 @@ where NET: TcpConnect, DNS: Dns{
 
         debug!("event loop: start sending packets");
 
-        let send_packet_result = self.publishes.send_packets(&self.connection_state, publisher).await?
-            .next(|| self.received_publishes.send_packets(&self.connection_state)).await?
-            .next(|| self.subscribes.send(&self.connection_state)).await?
+        let send_packet_result = self
+            .publishes
+            .send_packets(&self.connection_state, publisher)
+            .await?
+            .next(|| self.received_publishes.send_packets(&self.connection_state))
+            .await?
+            .next(|| self.subscribes.send(&self.connection_state))
+            .await?
             .next_sync(|| self.ping.send(&self.connection_state))?;
 
         if send_packet_result == SendResult::PartiallySent {
             debug!("partially sent packets, run io nonblocking");
+
+            // Actually flush the send buffer to the network
+            self.connection_state.send_all().await?;
+
             if let Some(packet) = self.connection_state.run_io_nonblocking().await? {
                 self.process_packet(&packet).await?;
             }
@@ -193,96 +241,96 @@ where NET: TcpConnect, DNS: Dns{
         let request_added_future = self.on_requst_added.next_notification();
 
         match select3(request_added_future, ping_future, io_future).await {
-            embassy_futures::select::Either3::First(request) if request == RequestNotification::Disconnect => {
+            embassy_futures::select::Either3::First(request)
+                if request == RequestNotification::Disconnect =>
+            {
                 debug!("run_once: disconnect request received");
                 Ok(false)
-            },
+            }
             embassy_futures::select::Either3::Third(packet) => {
                 debug!("run_once: received packet");
                 let packet = packet?;
                 self.process_packet(&packet).await?;
                 Ok(true)
-            },
+            }
             _ => {
                 debug!("run_once: stop io, new event arrived");
                 Ok(true)
-            },
+            }
         }
     }
 
     pub async fn run(&self) -> Result<(), MqttError> {
         loop {
             match self.run_once().await {
-                Ok(true) => {},
+                Ok(true) => {}
                 Ok(false) => {
                     // Disconnect
                     self.connection_state.disconnect().await?;
                     info!("disconnect: exit run loop");
-                    return Ok(())
-                },
+                    return Ok(());
+                }
                 Err(err) => {
                     error!("connection error: {}", &err);
                     match err {
-                        MqttError::ConnectionFailed2(_) |
-                        MqttError::ConnackError |
-                        MqttError::CodecError(_) |
-                        MqttError::ReceivedMessageTooLong |
-                        MqttError::QueueFull(_) |
-                        MqttError::UnexpectedAck(_)  => {
+                        MqttError::ConnectionFailed2(_)
+                        | MqttError::ConnackError
+                        | MqttError::CodecError(_)
+                        | MqttError::ReceivedMessageTooLong
+                        | MqttError::QueueFull(_)
+                        | MqttError::UnexpectedAck(_) => {
                             self.connection_state.set_error();
                             time::sleep(RECONNECT_DURATION).await;
-                        },
+                        }
 
                         err => {
                             error!("not recoverable error: stop loop");
-                            return Err(err)
-                        },
+                            return Err(err);
+                        }
                     }
-                },
+                }
             }
         }
     }
 
     /// Processes incoming packets
     async fn process_packet(&self, p: &Packet<'_>) -> Result<(), MqttError> {
-
         let publisher = self.events.dyn_publisher().unwrap();
 
         match p {
-            
             Packet::Connack(_connack) => {
                 panic!("received connack: this must be handled by the connection module");
-            },
-            
+            }
+
             Packet::Publish(publish) => {
                 self.received_publishes.on_publish(publish).await?;
                 Ok(())
-            },
+            }
 
             Packet::Puback(_) | Packet::Pubrec(_) | Packet::Pubcomp(_) => {
                 self.publishes.process_incoming_packet(p, publisher).await?;
                 Ok(())
-            },
+            }
 
             Packet::Pubrel(pid) => {
                 self.received_publishes.on_pubrel(*pid).await?;
                 Ok(())
-            },
+            }
 
             Packet::Suback(suback) => {
                 self.subscribes.on_suback(suback, publisher).await?;
                 Ok(())
-            },
-            
+            }
+
             Packet::Unsuback(pid) => {
                 self.subscribes.on_unsuback(*pid, publisher).await;
                 Ok(())
-            },
-            
+            }
+
             Packet::Pingresp => {
                 self.ping.on_ping_response();
                 Ok(())
-            },
+            }
 
             // # These Packages cannot be send Server -> Client
             // # And are treated as unexpected
@@ -291,9 +339,11 @@ where NET: TcpConnect, DNS: Dns{
             // Packet::Pingreq => todo!(),
             // Packet::Unsubscribe(unsubscribe) => todo!(),
             // Packet::Subscribe(subscribe) => todo!(),
-
             unexpected => {
-                error!("unexpected packet {} received from broker", unexpected.get_type());
+                error!(
+                    "unexpected packet {} received from broker",
+                    unexpected.get_type()
+                );
                 Ok(())
             }
         }
@@ -304,10 +354,11 @@ where NET: TcpConnect, DNS: Dns{
     }
 
     /// Subscribe to received publishes
-    pub fn subscribe_received_publishes(&self) -> Result<DynSubscriber<'_, ReceivedPublish<BUFFER, TOPIC>>, MqttError> {
+    pub fn subscribe_received_publishes(
+        &self,
+    ) -> Result<DynSubscriber<'_, ReceivedPublish<BUFFER, TOPIC>>, MqttError> {
         self.received_publishes.subscribe_publishes()
     }
-
 }
 
 // #[cfg(all(test, feature = "std"))]
@@ -363,7 +414,7 @@ where NET: TcpConnect, DNS: Dns{
 
 //         async fn process_packet(&mut self, packet: &Packet<'_>) -> Result<Vec<MqttEvent, 16>, MqttError>{
 //             self.state.process_packet(
-//                 packet, 
+//                 packet,
 //                 &mut self.send_buffer.create_writer()
 //             ).await
 //         }
@@ -410,7 +461,6 @@ where NET: TcpConnect, DNS: Dns{
 //             }
 //         }
 //     }
-
 
 //     #[tokio::test]
 //     async fn test_connect_and_connack() {
@@ -488,7 +538,7 @@ where NET: TcpConnect, DNS: Dns{
 //                 assert_eq!(c.client_id, "1234567890");
 //                 assert_eq!(c.password, None);
 //                 assert_eq!(c.username, None);
-                
+
 //                 let received_last_will = c.last_will.as_ref().unwrap();
 //                 assert_eq!(received_last_will.message, LAST_WILL_MESSAGE.as_bytes());
 //                 assert_eq!(received_last_will.topic, LAST_WILL_TOPIC);
@@ -569,9 +619,9 @@ where NET: TcpConnect, DNS: Dns{
 //     async fn test_auto_subscribe() {
 
 //         let config: ClientConfig = ClientConfig::new_with_auto_subscribes(
-//             "asghfdasdhasdh", 
-//             None, 
-//             [ "test1", "test2" ].into_iter(), 
+//             "asghfdasdhasdh",
+//             None,
+//             [ "test1", "test2" ].into_iter(),
 //             QoS::AtLeastOnce
 //         );
 
@@ -582,9 +632,9 @@ where NET: TcpConnect, DNS: Dns{
 //             assert_eq!(p.get_type(), PacketType::Connect, "expected connect packet");
 //         });
 
-//         test.process_packet(&Packet::Connack(Connack { 
-//             session_present: false, 
-//             code: ConnectReturnCode::Accepted 
+//         test.process_packet(&Packet::Connack(Connack {
+//             session_present: false,
+//             code: ConnectReturnCode::Accepted
 //         })).await.unwrap();
 
 //         test.state.send_packets(&mut test.send_buffer.create_writer(), &test.control_ch).unwrap();
